@@ -46,25 +46,30 @@ function mockLLMSummary(history, circuitBreakerState) {
   return `In the last 10 minutes, ${failureRate}% of payment attempts failed due to provider instability. ${breakerMsg}`;
 }
 
-async function attemptPaymentWithRetry(paymentData, maxRetries = 3, backoffs = [500, 1000, 2000]) {
-  let lastError;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      const result = processPayment(paymentData.amount);
-      return { success: true, result };
-    } catch (error) {
-      lastError = error;
-      if (attempt < maxRetries - 1) {
-        await sleep(backoffs[attempt]);
-      }
-    }
-  }
-  return { success: false, error: lastError.message };
+// Observability metrics
+let METRICS = {
+  totalRetries: 0,
+  totalAttempts: 0,
+  totalSuccesses: 0,
+  totalFailures: 0,
+  circuitTransitions: [], // { from, to, at }
+};
+
+function recordRetry() {
+  METRICS.totalRetries++;
 }
 
-function logFailedTransaction(paymentData, reason) {
-  // For now, just log to the console. In real-world, log to a file or DB.
-  console.error('Failed transaction:', { ...paymentData, reason });
+function recordAttemptMetrics(success) {
+  METRICS.totalAttempts++;
+  if (success) {
+    METRICS.totalSuccesses++;
+  } else {
+    METRICS.totalFailures++;
+  }
+}
+
+function recordCircuitTransition(from, to) {
+  METRICS.circuitTransitions.push({ from, to, at: new Date().toISOString() });
 }
 
 function canAttemptPayment() {
@@ -110,12 +115,51 @@ function onPaymentResult(success) {
   }
 }
 
+let LAST_FAILURE_TIMESTAMP = null;
+
+// Patch circuit breaker transitions
+const originalOnPaymentResult = onPaymentResult;
+onPaymentResult = function(success) {
+  const prevState = CIRCUIT_BREAKER.state;
+  originalOnPaymentResult(success);
+  const newState = CIRCUIT_BREAKER.state;
+  if (prevState !== newState) {
+    recordCircuitTransition(prevState, newState);
+  }
+};
+
+// Patch retry logic
+async function attemptPaymentWithRetry(paymentData, maxRetries = 3, backoffs = [500, 1000, 2000]) {
+  let lastError;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const result = processPayment(paymentData.amount);
+      if (attempt > 0) recordRetry();
+      return { success: true, result };
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxRetries - 1) {
+        await sleep(backoffs[attempt]);
+        recordRetry();
+      }
+    }
+  }
+  return { success: false, error: lastError.message };
+}
+
+function logFailedTransaction(paymentData, reason) {
+  // For now, just log to the console. In real-world, log to a file or DB.
+  console.error('Failed transaction:', { ...paymentData, reason });
+}
+
 app.post('/pay', async (req, res) => {
   const { amount, currency, source } = req.body;
   const paymentData = { amount, currency, source };
 
   if (!canAttemptPayment()) {
     recordAttempt(false, 'Circuit breaker open');
+    LAST_FAILURE_TIMESTAMP = new Date().toISOString();
+    recordAttemptMetrics(false);
     res.status(503).json({ success: false, error: 'Payment service temporarily unavailable (circuit breaker open).' });
     return;
   }
@@ -123,6 +167,10 @@ app.post('/pay', async (req, res) => {
   const result = await attemptPaymentWithRetry(paymentData);
   onPaymentResult(result.success);
   recordAttempt(result.success, result.success ? null : result.error);
+  recordAttemptMetrics(result.success);
+  if (!result.success) {
+    LAST_FAILURE_TIMESTAMP = new Date().toISOString();
+  }
 
   if (result.success) {
     res.json({ success: true, result: result.result });
@@ -135,6 +183,28 @@ app.post('/pay', async (req, res) => {
 app.get('/status/summary', (req, res) => {
   const summary = mockLLMSummary(ATTEMPT_HISTORY, CIRCUIT_BREAKER);
   res.json({ summary });
+});
+
+app.get('/status', (req, res) => {
+  res.json({
+    circuitState: CIRCUIT_BREAKER.state.toLowerCase(),
+    failureCount: CIRCUIT_BREAKER.failureCount,
+    lastFailure: LAST_FAILURE_TIMESTAMP
+  });
+});
+
+app.get('/metrics', (req, res) => {
+  const successRate = METRICS.totalAttempts ? (METRICS.totalSuccesses / METRICS.totalAttempts) * 100 : 0;
+  const failureRate = METRICS.totalAttempts ? (METRICS.totalFailures / METRICS.totalAttempts) * 100 : 0;
+  res.json({
+    retryCount: METRICS.totalRetries,
+    totalAttempts: METRICS.totalAttempts,
+    totalSuccesses: METRICS.totalSuccesses,
+    totalFailures: METRICS.totalFailures,
+    successRate: `${successRate.toFixed(2)}%`,
+    failureRate: `${failureRate.toFixed(2)}%`,
+    circuitTransitions: METRICS.circuitTransitions
+  });
 });
 
 const PORT = process.env.PORT || 3000;
